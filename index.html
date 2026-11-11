@@ -73,6 +73,15 @@
   }
   @keyframes shimmer { to { background-position: 300% 0; } }
   .tagline { color: var(--muted); letter-spacing: 6px; font-size: .8rem; text-transform: uppercase; margin-top: 4px; }
+  .live {
+    display: inline-flex; align-items: center; gap: 8px; margin-top: 12px; padding: 5px 14px; border-radius: 999px;
+    font-size: .75rem; font-weight: 800; letter-spacing: 2px; background: rgba(0, 0, 0, .35); border: 1px solid var(--glass-border);
+  }
+  .live .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--gold); box-shadow: 0 0 10px var(--gold); }
+  .live.on .dot { background: var(--lime); box-shadow: 0 0 10px var(--lime); animation: pulse 1.4s ease-out infinite; }
+  .live.off .dot { background: var(--red); box-shadow: 0 0 10px var(--red); }
+  @keyframes pulse { 0% { box-shadow: 0 0 0 0 rgba(124, 255, 107, .8); } 100% { box-shadow: 0 0 0 12px rgba(124, 255, 107, 0); } }
+  .btn-go:disabled { opacity: .6; cursor: wait; }
 
   .month-nav {
     display: inline-flex; align-items: center; gap: 14px; margin-top: 18px;
@@ -247,6 +256,7 @@
   <header>
     <h1 class="logo">MONEY FLOW</h1>
     <div class="tagline">✦ 나만의 우주 가계부 ✦</div>
+    <div class="live" id="live"><span class="dot"></span><span id="liveText">CONNECTING…</span></div><br>
     <div class="month-nav">
       <button class="round" id="prev" aria-label="이전 달">◀</button>
       <span id="monthLabel"></span>
@@ -314,9 +324,15 @@
   </div>
 </div>
 
+<script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2.58.0/dist/umd/supabase.min.js"></script>
 <script>
-  /* ===================== 데이터 (localStorage, DB 없음) ===================== */
-  const STORAGE_KEY = 'simple-budget-v1';
+  /* ===================== Supabase 연결 ===================== */
+  // publishable 키는 브라우저에 노출돼도 되는 공개용 키입니다 (권한은 RLS 정책으로 제어)
+  const SUPABASE_URL = 'https://letdzrbayptvdzowigdy.supabase.co';
+  const SUPABASE_KEY = 'sb_publishable_feaPkDF5_Opir_DpOWTACQ_FFu8JbUL';
+  const TABLE = 'transactions';
+  const db = supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
   const CATEGORIES = {
     expense: ['식비', '카페', '교통', '쇼핑', '주거', '통신', '문화', '기타'],
     income:  ['월급', '용돈', '부수입', '기타']
@@ -330,15 +346,67 @@
   const ymd = (d) => `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}`;
   const escapeHtml = (s) => s.replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 
-  function load() { try { return JSON.parse(localStorage.getItem(STORAGE_KEY)) || []; } catch { return []; } }
-  function save() { try { localStorage.setItem(STORAGE_KEY, JSON.stringify(items)); } catch {} }
-
-  let items = load();
+  let items = [];
   let view = new Date(); view.setDate(1);
-  let seenIds = new Set(items.map(i => i.id));
+  let seenIds = new Set();
+  const myInserts = new Set();   // 내가 방금 추가한 id (실시간 알림 중복 방지)
 
   const monthKey = () => `${view.getFullYear()}-${pad(view.getMonth() + 1)}`;
   const monthItems = () => items.filter(it => it.date.startsWith(monthKey()));
+  const monthRange = () => {
+    const y = view.getFullYear(), m = view.getMonth();
+    return [`${y}-${pad(m + 1)}-01`, ymd(new Date(y, m + 1, 1))];
+  };
+
+  /* ===================== DB 함수 ===================== */
+  const COLS = 'id,type,date,category,memo,amount';
+  function setLive(state, text) {
+    $('live').className = 'live ' + state;
+    $('liveText').textContent = text;
+  }
+  function dbError(error) {
+    console.error(error);
+    setLive('off', 'DB ERROR');
+    toast('⚠️ DB 오류: ' + error.message);
+  }
+  function upsertLocal(row) {
+    if (!items.some(i => i.id === row.id)) items.push(row);
+  }
+  async function fetchAll() {
+    const { data, error } = await db.from(TABLE).select(COLS).order('date', { ascending: false }).order('id', { ascending: false });
+    if (error) { dbError(error); return false; }
+    items = data;
+    return true;
+  }
+  async function insertRows(rows) {
+    const { data, error } = await db.from(TABLE).insert(rows).select(COLS);
+    if (error) { dbError(error); return null; }
+    data.forEach(r => { myInserts.add(r.id); upsertLocal(r); });
+    return data;
+  }
+
+  // 실시간: 다른 사람이 추가/삭제하면 내 화면에도 바로 반영
+  function subscribeRealtime() {
+    db.channel('transactions-live')
+      .on('postgres_changes', { event: 'INSERT', schema: 'public', table: TABLE }, ({ new: row }) => {
+        if (myInserts.has(row.id) || items.some(i => i.id === row.id)) return;
+        upsertLocal(row);
+        if (row.date.startsWith(monthKey())) {
+          burst(innerWidth / 2, innerHeight * 0.3, row.type);
+          toast(`📡 누군가 ${row.type === 'income' ? '+' : '−'}${won(row.amount)} 추가!`);
+        }
+        render();
+      })
+      .on('postgres_changes', { event: 'DELETE', schema: 'public', table: TABLE }, ({ old }) => {
+        const before = items.length;
+        items = items.filter(i => i.id !== old.id);
+        if (items.length !== before) render();
+      })
+      .subscribe((status) => {
+        if (status === 'SUBSCRIBED') setLive('on', 'LIVE · SUPABASE');
+        else if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') setLive('off', 'REALTIME OFF');
+      });
+  }
 
   function fillCategories() {
     const type = document.querySelector('input[name="type"]:checked').value;
@@ -378,7 +446,7 @@
         <div class="emo">${EMOJI[i.category] || '✨'}</div>
         <div>
           <div>${escapeHtml(i.memo || i.category)}</div>
-          <div class="meta">${i.date.slice(5).replace('-', '/')} · ${i.category}</div>
+          <div class="meta">${i.date.slice(5).replace('-', '/')} · ${escapeHtml(i.category)}</div>
         </div>
         <span class="money">${i.type === 'income' ? '+' : '−'}${won(i.amount)}</span>
         <button class="del" aria-label="삭제">✕</button>
@@ -415,7 +483,7 @@
           ${cats.map(([c, v], k) => `
             <div class="row" style="animation-delay:${k * 0.08}s;color:${COLORS[k % COLORS.length]}">
               <span class="dot" style="background:${COLORS[k % COLORS.length]}"></span>
-              <span style="color:var(--text)">${EMOJI[c] || ''} ${c}</span>
+              <span style="color:var(--text)">${EMOJI[c] || ''} ${escapeHtml(c)}</span>
               <span class="pct">${(v / total * 100).toFixed(0)}%</span>
             </div>`).join('')}
         </div>
@@ -438,7 +506,7 @@
   /* ===================== 이벤트 ===================== */
   document.querySelectorAll('input[name="type"]').forEach(r => r.addEventListener('change', fillCategories));
 
-  $('form').addEventListener('submit', (e) => {
+  $('form').addEventListener('submit', async (e) => {
     e.preventDefault();
     const amount = Math.round(Number($('amount').value));
     if (!amount || amount <= 0 || !$('date').value) {
@@ -446,15 +514,17 @@
       toast('💥 금액을 입력해 주세요!');
       return;
     }
-    const item = {
-      id: Date.now(),
+    $('goBtn').disabled = true;
+    const saved = await insertRows([{
       type: document.querySelector('input[name="type"]:checked').value,
       date: $('date').value,
       category: selectedCategory(),
       memo: $('memo').value.trim(),
       amount
-    };
-    items.push(item); save();
+    }]);
+    $('goBtn').disabled = false;
+    if (!saved) return;
+    const item = saved[0];
     const [y, m] = item.date.split('-').map(Number);
     view = new Date(y, m - 1, 1);
     $('memo').value = ''; $('amount').value = '';
@@ -465,32 +535,37 @@
     render();
   });
 
-  $('list').addEventListener('click', (e) => {
+  $('list').addEventListener('click', async (e) => {
     const btn = e.target.closest('.del');
     if (!btn) return;
     const li = btn.closest('li');
+    const id = Number(li.dataset.id);
+    btn.disabled = true;
+    const { error } = await db.from(TABLE).delete().eq('id', id);
+    if (error) { btn.disabled = false; return dbError(error); }
     const r = li.getBoundingClientRect();
     sparkle(r.right - 20, r.top + r.height / 2, 30);
     li.classList.add('removing');
-    setTimeout(() => {
-      items = items.filter(i => i.id !== Number(li.dataset.id)); save(); render();
-    }, 380);
+    setTimeout(() => { items = items.filter(i => i.id !== id); render(); }, 380);
   });
 
   $('prev').addEventListener('click', () => { view.setMonth(view.getMonth() - 1); render(); });
   $('next').addEventListener('click', () => { view.setMonth(view.getMonth() + 1); render(); });
 
-  $('clearBtn').addEventListener('click', () => {
+  $('clearBtn').addEventListener('click', async () => {
     const n = monthItems().length;
     if (!n) return toast('🫥 지울 내역이 없어요');
-    if (!confirm(`${$('monthLabel').textContent} 내역 ${n}건을 모두 삭제할까요?`)) return;
-    items = items.filter(i => !i.date.startsWith(monthKey())); save();
+    if (!confirm(`${$('monthLabel').textContent} 내역 ${n}건을 모두 삭제할까요?\n(DB에서 지워지며 모든 사람 화면에서 사라집니다)`)) return;
+    const [from, to] = monthRange();
+    const { error } = await db.from(TABLE).delete().gte('date', from).lt('date', to);
+    if (error) return dbError(error);
+    items = items.filter(i => !i.date.startsWith(monthKey()));
     for (let k = 0; k < 6; k++) setTimeout(() => sparkle(Math.random() * innerWidth, Math.random() * innerHeight * .7, 40), k * 120);
     toast('🧨 펑! 싹 지웠어요');
     render();
   });
 
-  $('demoBtn').addEventListener('click', () => {
+  $('demoBtn').addEventListener('click', async () => {
     const y = view.getFullYear(), m = view.getMonth();
     const days = new Date(y, m + 1, 0).getDate();
     const sample = [
@@ -501,11 +576,12 @@
       ['expense', '문화', '영화 + 팝콘 🍿', 28000], ['expense', '식비', '마라탕', 15000],
       ['expense', '카페', '케이크 🍰', 7800], ['expense', '식비', '장보기', 87000]
     ];
-    let base = Date.now();
-    sample.forEach(([type, category, memo, amount], k) => {
-      items.push({ id: base + k, type, category, memo, amount, date: `${y}-${pad(m + 1)}-${pad(1 + Math.floor(Math.random() * days))}` });
-    });
-    save();
+    const rows = sample.map(([type, category, memo, amount]) =>
+      ({ type, category, memo, amount, date: `${y}-${pad(m + 1)}-${pad(1 + Math.floor(Math.random() * days))}` }));
+    $('demoBtn').disabled = true;
+    const saved = await insertRows(rows);
+    $('demoBtn').disabled = false;
+    if (!saved) return;
     for (let k = 0; k < 5; k++) setTimeout(() => burst(innerWidth * (0.15 + k * 0.175), innerHeight * 0.35, k % 2 ? 'income' : 'expense'), k * 140);
     toast('🎉 샘플 데이터 투하!');
     render();
@@ -645,6 +721,13 @@
   $('date').value = ymd(new Date());
   fillCategories();
   render();
+  (async () => {
+    if (await fetchAll()) {
+      seenIds = new Set(items.map(i => i.id));
+      render();
+      subscribeRealtime();
+    }
+  })();
   setTimeout(() => burst(innerWidth / 2, innerHeight * 0.18, 'income'), 400);
 </script>
 </body>
